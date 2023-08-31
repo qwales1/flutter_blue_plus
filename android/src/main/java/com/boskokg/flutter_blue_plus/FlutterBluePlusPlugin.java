@@ -34,6 +34,8 @@ import android.os.Looper;
 import android.os.ParcelUuid;
 import android.util.Log;
 import android.util.SparseArray;
+import android.net.wifi.WifiManager;
+import android.text.format.Formatter;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,6 +53,13 @@ import java.io.PrintWriter;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
+import java.net.SocketException;
+import java.net.UnknownHostException;
+import java.io.OutputStream;
+import java.io.InputStream;
 
 import java.lang.reflect.Method;
 
@@ -58,6 +67,7 @@ import androidx.annotation.NonNull;
 import androidx.annotation.RequiresApi;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import java.net.SocketAddress;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
 import io.flutter.embedding.engine.plugins.activity.ActivityAware;
@@ -71,6 +81,9 @@ import io.flutter.plugin.common.MethodChannel;
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler;
 import io.flutter.plugin.common.MethodChannel.Result;
 import io.flutter.plugin.common.PluginRegistry.RequestPermissionsResultListener;
+import java.net.DatagramSocket;
+import java.net.DatagramPacket;
+import android.bluetooth.BluetoothSocket;
 
 public class FlutterBluePlusPlugin implements
     FlutterPlugin,
@@ -79,6 +92,8 @@ public class FlutterBluePlusPlugin implements
     ActivityAware
 {
     private static final String TAG = "[FBP-Android]";
+
+
 
     private LogLevel logLevel = LogLevel.DEBUG;
 
@@ -95,6 +110,11 @@ public class FlutterBluePlusPlugin implements
     static final private UUID CCCD_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb");
 
     private final Map<String, BluetoothGatt> mConnectedDevices = new ConcurrentHashMap<>();
+    private final Map<String, DatagramSocket> mUdpSockets = new ConcurrentHashMap<>();
+    private final Map<String, BluetoothSocket> mL2CapSockets = new ConcurrentHashMap<>();
+    private final Map<String, Thread> mHawkinWorkerThreads = new ConcurrentHashMap<>();
+
+    
     private final Map<String, Integer> mMtu = new ConcurrentHashMap<>();
 
     private int lastEventId = 1452;
@@ -107,6 +127,14 @@ public class FlutterBluePlusPlugin implements
     }
 
     public FlutterBluePlusPlugin() {}
+
+    String getIp() {
+         Context mContext = context.getApplicationContext();
+         WifiManager wm = (WifiManager) mContext.getSystemService(Context.WIFI_SERVICE);
+                        String ip = Formatter.formatIpAddress(wm.getConnectionInfo().getIpAddress());
+                        log(LogLevel.DEBUG, ip.toString());
+        return ip;
+    }
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding flutterPluginBinding)
@@ -185,7 +213,7 @@ public class FlutterBluePlusPlugin implements
     // ██      ██  ███████     ██     ██   ██   ██████   ██████
     //
     //  ██████   █████   ██       ██
-    // ██       ██   ██  ██       ██
+    // ██       ██   ██  ██       ██Gatt
     // ██       ███████  ██       ██
     // ██       ██   ██  ██       ██
     //  ██████  ██   ██  ███████  ███████
@@ -471,7 +499,7 @@ public class FlutterBluePlusPlugin implements
                         if (gatt == null) {
                             result.error("connect", String.format("device.connectGatt returned null"), null);
                             return;
-                        }
+                        } 
 
                         result.success(0);
                     });
@@ -493,6 +521,99 @@ public class FlutterBluePlusPlugin implements
                     gatt.disconnect();
 
                     result.success(0);
+                    break;
+                }
+
+                case "hawkinDisconnect": 
+                {
+                    String remoteId = (String) call.arguments;
+
+
+                    Thread workerThread = mHawkinWorkerThreads.get(remoteId);
+                    if (workerThread == null) {
+                        log(LogLevel.DEBUG, "[FBP-Android] Hawkin Worker Thread already disconnected");
+                    } else {
+                        workerThread.interrupt();
+                        mHawkinWorkerThreads.remove(remoteId);
+                    }
+
+            
+                    BluetoothGatt gatt = mConnectedDevices.get(remoteId);
+                    if (gatt == null) {
+                        log(LogLevel.DEBUG, "[FBP-Android] GATT already disconnected");
+                    } else {
+                        gatt.disconnect();
+                        mConnectedDevices.remove(remoteId);
+                    }
+                                  
+                    result.success(0);
+                    break;
+                }
+
+                case "hawkinConnect": 
+                {
+                    ArrayList<String> permissions = new ArrayList<>();
+
+                    if (Build.VERSION.SDK_INT >= 31) { // Android 12 (October 2021)
+                        permissions.add(Manifest.permission.BLUETOOTH_CONNECT);
+                    }
+
+                    ensurePermissions(permissions, (granted, perm) -> {
+
+                        if (!granted) {
+                            result.error("connect",
+                                String.format("FlutterBluePlus requires %s for new connection", perm), null);
+                            return;
+                        }
+                        
+                        HashMap<String, Object> args = call.arguments();
+                        String remoteId =  (String)  args.get("remote_id");
+                        boolean autoConnect = ((int) args.get("auto_connect")) != 0;
+
+
+                       // already connected?
+                        Thread workerThread = mHawkinWorkerThreads.get(remoteId);
+                        if (workerThread != null) {
+                            log(LogLevel.DEBUG, "[FBP-Android] already connected");
+                            result.success(Map.of("status", "1"));  // no work to do
+                            return;
+                        } 
+
+                        /*
+                          // connect with new gatt
+                        BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(remoteId);
+                        BluetoothGatt gatt;
+                        if (Build.VERSION.SDK_INT >= 23) { // Android 6.0 (October 2015)
+                            gatt = device.connectGatt(context, autoConnect, mGattCallback, BluetoothDevice.TRANSPORT_LE);
+                        } else {
+                            gatt = device.connectGatt(context, autoConnect, mGattCallback);
+                        }
+                        if(gatt == null) {
+                            log(LogLevel.DEBUG, "[FBP-Android] No Gatt");
+                            result.success(Map.of("status", "1"));  // no work to do
+                            return;
+                        }
+                         */
+                
+                        String ip = getIp();
+
+                  
+
+                        log(LogLevel.DEBUG, ip.toString());
+                      
+                        Thread connectWorker = new ConnectThread(mBluetoothAdapter.getRemoteDevice(remoteId));
+
+                        mHawkinWorkerThreads.put(remoteId, connectWorker);
+                        connectWorker.start();
+                              result.success(
+                            Map.of("status", "0", 
+                            "udp_address", ip, 
+                            "udp_port", Integer.toString(4444)
+                            )
+                        );
+                        return;
+
+                    });
                     break;
                 }
 
@@ -1428,7 +1549,7 @@ public class FlutterBluePlusPlugin implements
                 mConnectedDevices.put(remoteId, gatt);
 
                 // default minimum mtu
-                mMtu.put(remoteId, 23); 
+                mMtu.put(remoteId, 23);
             }
 
             // disconnected?
@@ -1563,6 +1684,76 @@ public class FlutterBluePlusPlugin implements
             response.put("error_string", gattErrorString(status));
 
             invokeMethodUIThread("OnDescriptorResponse", response);
+        }
+
+        private void closeConnectionWorker(String remoteId) {
+            Thread workerThread = mHawkinWorkerThreads.get(remoteId);
+            if(workerThread != null) {
+                workerThread.interrupt();
+                mHawkinWorkerThreads.remove(remoteId);
+            }
+        }
+
+        private void connectConnectionWorker(String remoteId) {
+            ///@TODO this should be fetched from GATT characteristic instead of hardcoded
+            int psm = 133;
+            try {
+                BluetoothDevice device = mBluetoothAdapter.getRemoteDevice(remoteId);
+                final BluetoothSocket socket = device.createInsecureL2capChannel(psm);
+                socket.connect();
+                log(LogLevel.DEBUG, "[FBP-Android] L2CAP Socket created");
+                final DatagramSocket mUdpSocket = new DatagramSocket(4444);
+                Thread mThread = new Thread(() -> {  
+                    try {
+                        while(!Thread.currentThread().isInterrupted()) {
+                            /// read from the udp socket and send to the l2cap socket
+                            try {
+                                mUdpSocket.setSoTimeout(100);
+                                byte[] buffer = new byte[600];
+                                DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                                mUdpSocket.receive(packet);
+                                byte[] b = packet.getData(); 
+                                if(b.length > 0) {
+                                    socket.getOutputStream().write(b);
+                                }
+                                
+                            } catch (SocketTimeoutException e) {
+                                // ignore
+                            } catch (IOException e) {
+                                log(LogLevel.ERROR, e.toString());
+                                Thread.currentThread().interrupt();
+                                
+                            }
+                            try {
+                                /// read from the l2cap socket and send to the UDP mUdpSockets
+                                if(socket.getInputStream().available() > 0) {
+                                    byte[] buffer = socket.getInputStream().readAllBytes();
+                                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                                    mUdpSocket.send(packet);
+                                }
+                            } catch (IOException e) {
+                                log(LogLevel.ERROR, e.toString());
+                                Thread.currentThread().interrupt();
+                                
+                            } catch (Exception e) {
+                                log(LogLevel.ERROR, e.toString());
+                                Thread.currentThread().interrupt();
+                            }
+                        }
+                        socket.close();
+                        mUdpSocket.close();
+                    } catch(Exception e) {
+                        Thread.currentThread().interrupt();
+                        log(LogLevel.ERROR, e.toString());
+                        return;
+                    }        
+                });
+                mHawkinWorkerThreads.put(remoteId, mThread);
+                mThread.start();
+            } catch (Exception e) {
+                log(LogLevel.ERROR, e.toString());
+                return;
+            }    
         }
 
         @Override
@@ -2205,4 +2396,175 @@ public class FlutterBluePlusPlugin implements
         DEBUG,   // 4
         VERBOSE  // 5
     }
+
+    private class ConnectThread extends Thread {
+    private final BluetoothSocket mmSocket;
+    private final BluetoothDevice mmDevice;
+
+    public ConnectThread(BluetoothDevice device) {
+        // Use a temporary object that is later assigned to mmSocket,
+        // because mmSocket is final
+        BluetoothSocket tmp = null;
+        mmDevice = device;
+
+        // Get a BluetoothSocket to connect with the given BluetoothDevice
+        try {
+            tmp = device.createInsecureL2capChannel(133);
+        } catch (IOException e) { }
+        mmSocket = tmp;
+    }
+
+    public void run() {
+        // Cancel discovery because it will slow down the connection
+        mBluetoothAdapter.cancelDiscovery();
+
+        try {
+            // Connect the device through the socket. This will block
+            // until it succeeds or throws an exception
+            mmSocket.connect();
+        } catch (IOException connectException) {
+            // Unable to connect; close the socket and get out
+            try {
+                mmSocket.close();
+            } catch (IOException closeException) {
+                log(LogLevel.ERROR, closeException.toString());
+             }
+             log(LogLevel.ERROR, connectException.toString());
+            return;
+        }
+
+        // Do work to manage the connection (in a separate thread)
+       Thread thread = new ConnectedThread(mmSocket);
+       thread.start();
+       
+    }
+
+    /** Will cancel an in-progress connection, and close the socket */
+    public void cancel() {
+        try {
+            mmSocket.close();
+        } catch (IOException e) { }
+    }
+}
+
+
+private class ConnectedThread extends Thread {
+    private final BluetoothSocket mmSocket;
+    private final InputStream mmInStream;
+    private final OutputStream mmOutStream;
+    private InetAddress udpReplyAddress;
+    private DatagramSocket udpReplySocket;
+    private DatagramSocket udpRecieveSocket;
+
+    public ConnectedThread(BluetoothSocket socket) {
+        mmSocket = socket;
+        InputStream tmpIn = null;
+        OutputStream tmpOut = null;
+
+        // Get the input and output streams, using temp objects because
+        // member streams are final
+        try {
+            tmpIn = socket.getInputStream();
+            tmpOut = socket.getOutputStream();
+        } catch (IOException e) { 
+            log(LogLevel.DEBUG, e.toString());
+        }
+
+       try {
+            udpRecieveSocket = new DatagramSocket(4444, InetAddress.getByName(getIp()));
+            udpRecieveSocket.setBroadcast(true);
+            udpRecieveSocket.setSoTimeout(100);
+       } catch(SocketException e) {
+              log(LogLevel.ERROR, e.toString());
+       } catch(UnknownHostException e) {
+            log(LogLevel.ERROR, e.toString());
+       }
+       
+        mmInStream = tmpIn;
+        mmOutStream = tmpOut;
+    }
+
+    public void run() {
+
+        try {
+            while(!Thread.currentThread().isInterrupted()) {
+                /// read from the udp socket and send to the l2cap socket
+                try {
+                    byte[] buffer = new byte[600];
+                    DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+                    udpRecieveSocket.setSoTimeout(100);
+                    udpRecieveSocket.receive(packet);
+                    byte[] b = packet.getData(); 
+                    log(LogLevel.DEBUG, "read " + b.length + " bytes from udp socket");
+                    if(b.length > 0) {
+                        udpReplyAddress = packet.getAddress();
+                        udpReplySocket = new DatagramSocket();
+                        log(LogLevel.DEBUG, "udpReplyAddress: " + udpReplyAddress.toString());
+                        log(LogLevel.DEBUG, "write " + b.length + " bytes to l2cap socket");
+                        mmOutStream.write(b);
+                    }
+                    
+                } catch (SocketTimeoutException e) {
+                  /// ignore
+                } catch (IOException e) {
+                    log(LogLevel.ERROR, e.toString());
+                     Thread.currentThread().interrupt();
+                } catch(Exception e) {
+                    log(LogLevel.ERROR, e.toString());
+                    Thread.currentThread().interrupt();
+                }
+          
+                try {
+                    /// read from the l2cap socket and send to the UDP mUdpSockets
+                    if(mmInStream.available() > 0) {
+                        log(LogLevel.DEBUG, "data available on l2cap socket");
+                        byte[] buffer = new byte[600];
+                        for(int i = 0; i < mmInStream.available(); i++) {
+                            mmInStream.read(buffer, i, 1);
+                        }
+                        log(LogLevel.DEBUG, "read " + buffer.length + " bytes from l2cap socket");
+                        if(udpReplyAddress != null) {
+                             DatagramPacket packet = new DatagramPacket(buffer, 0, buffer.length, udpReplyAddress, 4444);
+                            udpReplySocket.send(packet);
+                            log(LogLevel.DEBUG, "write" + buffer.length + " bytes to udp socket");
+                        }
+                 
+                    }
+                } catch (SocketTimeoutException e) {
+                    log(LogLevel.DEBUG, e.toString());
+                } catch (IOException e) {
+                    log(LogLevel.ERROR, e.toString());
+                    Thread.currentThread().interrupt();
+                    
+                } catch (Exception e) {
+                    log(LogLevel.ERROR, e.toString());
+                    Thread.currentThread().interrupt();
+                }
+            }
+            mmSocket.close();
+            if(udpReplySocket != null) {
+                udpReplySocket.close();
+            }
+            if(udpRecieveSocket != null) {
+                udpRecieveSocket.close();
+            }
+            log(LogLevel.DEBUG, "thread interrupted");
+        } catch (IOException e) {
+            log(LogLevel.ERROR, e.toString());
+            Thread.currentThread().interrupt();
+            return;
+        } catch(Exception e) {
+            Thread.currentThread().interrupt();
+            log(LogLevel.ERROR, e.toString());
+            return;
+        }        
+    }
+
+    /* Call this from the main Activity to shutdown the connection */
+    public void cancel() {
+        try {
+            mmSocket.close();
+        } catch (IOException e) { }
+    }
+}
 }
